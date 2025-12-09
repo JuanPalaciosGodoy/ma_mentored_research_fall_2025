@@ -1,8 +1,10 @@
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from typing import Optional, Tuple
 import pandas as pd
 import numpy as np
 from scipy import stats
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 
 
@@ -153,6 +155,47 @@ class EWMAVaR:
 # AR MODEL
 ################
 
+def get_predictor(predictor_name: str, predictor_params: dict):
+    """
+    Factory for base time-series predictors.
+
+    Parameters
+    ----------
+    predictor_name : {'ar', 'sarimax'}
+    predictor_params : dict
+        For 'ar':
+            {'lags': int}
+        For 'sarimax':
+            {
+                'order': (p,d,q),
+                'seasonal_order': (P,D,Q,s),
+                'trend': 'n'|'c'|'t'|'ct',
+                'enforce_stationarity': bool,
+                'enforce_invertibility': bool,
+            }
+    """
+    predictor_params = predictor_params or {}
+
+    if predictor_name == 'ar':
+        # Default to lags=3 if not provided
+        if 'lags' not in predictor_params:
+            predictor_params['lags'] = 3
+        return SimpleARPredictor(**predictor_params)
+
+    elif predictor_name == 'sarimax':
+        # Provide some sane defaults if any missing
+        predictor_params.setdefault('order', (1, 0, 0))
+        predictor_params.setdefault('seasonal_order', (0, 0, 0, 0))
+        predictor_params.setdefault('trend', 'c')
+        predictor_params.setdefault('enforce_stationarity', False)
+        predictor_params.setdefault('enforce_invertibility', False)
+        return SimpleSARIMAXPredictor(**predictor_params)
+
+    else:
+        raise ValueError("predictor_name must be 'ar' or 'sarimax'")
+
+
+
 class SimpleARPredictor:
 
     def __init__(self, lags:int=1):
@@ -161,7 +204,7 @@ class SimpleARPredictor:
         self.intercept=0
         self.residuals=None
 
-    def fit(self, data:np.ndarray) -> None:
+    def fit(self, data:np.ndarray, X: Optional[np.ndarray] = None) -> None:
         if len(data) < self.lags + 2:
             self.coefficients = np.zeros(self.lags)
             self.intercept = np.mean(data) if len(data) > 0 else 0
@@ -169,20 +212,20 @@ class SimpleARPredictor:
             return
 
         # Create lagged features
-        X = np.column_stack([data[self.lags-i-1:-i-1] for i in range(self.lags)])
+        Xlag = np.column_stack([data[self.lags-i-1:-i-1] for i in range(self.lags)])
         y = data[self.lags:]
 
         # add intercept
-        X = np.column_stack([np.ones(len(X)), X])
+        Xlag = np.column_stack([np.ones(len(Xlag)), Xlag])
 
         # OLS solution
         try:
-            beta = np.linalg.lstsq(X, y, rcond=None)[0]
+            beta = np.linalg.lstsq(Xlag, y, rcond=None)[0]
             self.intercept = beta[0]
             self.coefficients = beta[1:]
 
             # calculate residuals
-            y_pred = X @ beta
+            y_pred = Xlag @ beta
             self.residuals = y - y_pred
 
         except:
@@ -190,36 +233,200 @@ class SimpleARPredictor:
             self.intercept = np.mean(data)
             self.residuals = np.zeros(1)
 
-    def predict(self, data:np.ndarray) -> float:
+    def predict(self, data:np.ndarray, X: Optional[np.ndarray] = None) -> float:
         if self.coefficients is None:
             return np.mean(data) if len(data)>0 else 0
         recent = data[-self.lags:]
         return self.intercept + np.dot(self.coefficients, recent[::-1])
-    
+
+
+################
+# SARIMAX MODEL
+################
+
+
+class SimpleSARIMAXPredictor:
+    """
+    SARIMAX wrapper with a SimpleARPredictor-style interface, now supporting exogenous variables.
+
+    - __init__(...) sets SARIMAX structure.
+    - fit(data, X=None) fits the model (optionally with exogenous features).
+    - predict(data, X_future=None) produces a 1-step-ahead forecast.
+
+    Parameters
+    ----------
+    order : (p, d, q)
+    seasonal_order : (P, D, Q, s)
+    trend : 'n', 'c', 't', or 'ct'
+    """
+
+    def __init__(
+        self,
+        order: Tuple[int, int, int] = (1, 0, 0),
+        seasonal_order: Tuple[int, int, int, int] = (0, 0, 0, 0),
+        trend: str = "c",
+        enforce_stationarity: bool = False,
+        enforce_invertibility: bool = False,
+    ):
+        self.order = order
+        self.seasonal_order = seasonal_order
+        self.trend = trend
+        self.enforce_stationarity = enforce_stationarity
+        self.enforce_invertibility = enforce_invertibility
+
+        # Fitted objects
+        self.model_ = None
+        self.result_ = None
+
+        # Diagnostics
+        self.residuals: Optional[np.ndarray] = None
+        self.mean_ = 0.0
+        self.is_fitted = False
+
+        # Exogenous info
+        self.has_exog = False
+        self.n_exog_features: Optional[int] = None
+
+    def fit(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> None:
+        """
+        Fit the SARIMAX model to a 1D numpy array, optionally with exogenous variables.
+
+        Parameters
+        ----------
+        data : 1D np.ndarray
+            Target time series.
+        X : 2D np.ndarray, optional
+            Exogenous regressors (same number of rows as data).
+        """
+        y = np.asarray(data, dtype=float).ravel()
+
+        # Basic exog checks
+        if X is not None:
+            X = np.asarray(X, dtype=float)
+            if X.ndim == 1:
+                X = X.reshape(-1, 1)
+            if len(X) != len(y):
+                raise ValueError("X and data must have the same length.")
+            self.has_exog = True
+            self.n_exog_features = X.shape[1]
+        else:
+            self.has_exog = False
+            self.n_exog_features = None
+
+        # Fallback for too-short series (similar spirit to SimpleARPredictor)
+        min_obs = max(
+            10,
+            sum(self.order) + self.seasonal_order[3] * sum(self.seasonal_order[:3]) + 1,
+        )
+        if len(y) < min_obs:
+            self.model_ = None
+            self.result_ = None
+            self.residuals = np.zeros(1)
+            self.mean_ = float(np.mean(y)) if len(y) > 0 else 0.0
+            self.is_fitted = False
+            return
+
+        try:
+            self.mean_ = float(np.mean(y))
+
+            self.model_ = SARIMAX(
+                y,
+                exog=X if self.has_exog else None,
+                order=self.order,
+                seasonal_order=self.seasonal_order,
+                trend=self.trend,
+                enforce_stationarity=self.enforce_stationarity,
+                enforce_invertibility=self.enforce_invertibility,
+            )
+            self.result_ = self.model_.fit(disp=False)
+
+            # One-step-ahead residuals
+            self.residuals = np.asarray(self.result_.resid, dtype=float)
+            self.is_fitted = True
+
+        except Exception as e:
+            print(f"[SimpleSARIMAXPredictor] Fit failed: {e}")
+            self.model_ = None
+            self.result_ = None
+            self.residuals = np.zeros(1)
+            self.mean_ = float(np.mean(y)) if len(y) > 0 else 0.0
+            self.is_fitted = False
+
+    def predict(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> float:
+        """
+        One-step-ahead prediction.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Kept for API symmetry with SimpleARPredictor.
+            Used only for fallback behavior if model not fitted.
+        X_future : np.ndarray, optional
+            Exogenous value(s) for the *next* time step.
+            If the model was fit with exogenous variables, you must pass
+            one row with the same number of features used in fit().
+
+        Returns
+        -------
+        float
+            Forecast for the next time step.
+        """
+        # If model is not fitted, fall back to mean of provided data
+        if not self.is_fitted or self.result_ is None:
+            data = np.asarray(data, dtype=float)
+            if len(data) == 0:
+                return 0.0
+            return float(np.mean(data))
+
+        # Prepare exogenous for forecasting, if needed
+        exog_fc = None
+        if self.has_exog:
+            if X is None:
+                # No exog provided, fall back to unconditional mean
+                print("[SimpleSARIMAXPredictor] X_future is required for exogenous model; using mean fallback.")
+                return self.mean_
+
+            X = np.asarray(X, dtype=float)
+            # Ensure shape (1, n_features)
+            if X.ndim == 1:
+                X = X.reshape(1, -1)
+
+            if X.shape[1] != self.n_exog_features:
+                raise ValueError(
+                    f"X_future must have {self.n_exog_features} features, "
+                    f"got {X.shape[1]}"
+                )
+            exog_fc = X
+
+        try:
+            fc = self.result_.get_forecast(steps=1, exog=exog_fc)
+            return float(fc.predicted_mean.iloc[0])
+        except Exception as e:
+            print(f"[SimpleSARIMAXPredictor] Predict failed, using fallback mean: {e}")
+            return self.mean_
+
 
 class ConformalPIDPredictor:
     """
     Conformal PID Control for Time Series Risk Measurement
 
-    Implements the framework from Angelopulor et al. (2023):
-    - P Control: Quantile tracking via online gradient descent
-    - I Control: Error integration with saturation function
-    - D Control: Scorecasting to anticipate score trends
+    Implements the framework from Angelopoulos et al. (2023).
 
-    Uses simple AR model for computational efficiency
+    Now supports both AR and SARIMAX predictors, with optional exogenous variables X.
     """
 
     def __init__(
         self,
-        window_size:int=250,
-        learning_rate:float=0.1,
-        use_integrator:bool=True,
-        use_scorecaster:bool=True,
-        integrator_type:str='tan',
-        K_I:float=0.5,
-        C_sat:float=10.0,
-        ar_lags:int=3,
-        refit_frequency:int=10
+        window_size: int = 250,
+        learning_rate: float = 0.1,
+        use_integrator: bool = True,
+        use_scorecaster: bool = True,
+        integrator_type: str = 'tan',
+        K_I: float = 0.5,
+        C_sat: float = 10.0,
+        predictor_name: str = 'ar',
+        predictor_params: dict | None = None,
+        refit_frequency: int = 10
     ):
         self.window_size = window_size
         self.learning_rate = learning_rate
@@ -228,41 +435,73 @@ class ConformalPIDPredictor:
         self.integrator_type = integrator_type
         self.K_I = K_I
         self.C_sat = C_sat
-        self.ar_lags = ar_lags
+        self.predictor_name = predictor_name
+        self.predictor_params = predictor_params
         self.refit_frequency = refit_frequency
 
-        self.data = None
-        self.predictor = SimpleARPredictor(lags=ar_lags)
+        self.data = None           # y
+        self.X = None              # exogenous (if any)
+
+        # base predictor (AR or SARIMAX)
+        self.predictor = get_predictor(
+            predictor_name=self.predictor_name,
+            predictor_params=self.predictor_params
+        )
+
+        # minimal history needed before we start using predictions
+        if predictor_name == 'ar':
+            # Look for lags or ar_lags in params
+            self.min_history = self.predictor_params.get(
+                'lags',
+                self.predictor_params.get('ar_lags', 1)
+            )
+        elif predictor_name == 'sarimax':
+            order = self.predictor_params.get('order', (1, 0, 0))
+            seasonal_order = self.predictor_params.get('seasonal_order', (0, 0, 0, 0))
+            self.min_history = self.predictor_params.get(
+                'min_history',
+                max(10, sum(order) + seasonal_order[3] * sum(seasonal_order[:3]))
+            )
+        else:
+            self.min_history = 1
 
         # conformal state
         self.conformity_scores = []
         self.cumulative_error = 0.0
-        self.current_quantile=None
-        self.coverage_history=[]
-        self.update_count=0
-        self.score_window=20
+        self.current_quantile = None
+        self.coverage_history = []
+        self.update_count = 0
+        self.score_window = 20
 
-    def fit(self, data:np.ndarray) -> None:
+    def fit(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> None:
+        """Fit predictor on last window_size observations, with optional exogenous X."""
         self.data = data[-self.window_size:].copy()
-        self.predictor.fit(self.data)
+
+        if X is not None:
+            X = np.asarray(X)
+            self.X = X[-self.window_size:].copy()
+            self.predictor.fit(self.data, self.X)
+        else:
+            self.X = None
+            self.predictor.fit(self.data)
 
         # initialize from residuals
         if self.predictor.residuals is not None and len(self.predictor.residuals) > 0:
             self.conformity_scores = list(np.abs(self.predictor.residuals))
             self.current_quantile = np.percentile(self.conformity_scores, 95)
         else:
-            self.current_quantile = np.std(self.data) * 2
+            self.current_quantile = np.std(self.data) * 2 if len(self.data) > 0 else 1.0
 
-    def _tan_integrator(self, x:float, t:int) -> float:
+    def _tan_integrator(self, x: float, t: int) -> float:
         if t <= 1:
             return 0.0
         arg = x * np.log(t) / (t * self.C_sat)
         arg = np.clip(arg, -np.pi/2 + 0.01, np.pi/2 - 0.01)
         return self.K_I * np.tan(arg)
 
-    def _linear_integrator(self, x:float, t:int) -> float:
+    def _linear_integrator(self, x: float, t: int) -> float:
         return self.learning_rate * x
-    
+
     def _scorecast(self) -> float:
         if len(self.conformity_scores) < self.score_window:
             return np.mean(self.conformity_scores) if self.conformity_scores else 0.0
@@ -270,24 +509,28 @@ class ConformalPIDPredictor:
         weights = np.exp(-0.1 * np.arange(self.score_window)[::-1])
         weights /= weights.sum()
         return np.dot(weights, recent_scores)
-    
-    def predict_risk(self, alpha:float=0.05) -> tuple[float, float]:
-        if self.data is None or len(self.data) < self.ar_lags:
-            return (np.nan, np.nan)
-        
-        # point forecast
-        point_forecast = self.predictor.predict(self.data)
 
-        # calculate adaptive quantile
+    def predict_risk(
+        self,
+        alpha: float = 0.05,
+        X_future: Optional[np.ndarray] = None
+    ) -> tuple[float, float]:
+        if self.data is None or len(self.data) < self.min_history:
+            return (np.nan, np.nan)
+
+        # point forecast (passes exogenous for next step if provided)
+        point_forecast = self.predictor.predict(self.data, X_future==X_future)
+
+        # time index for PID control
         t = len(self.conformity_scores) + 1
 
         # D control: scorecaster
         if self.use_scorecaster and len(self.conformity_scores) > 0:
             q_hat = self._scorecast()
         else:
-            q_hat = self.current_quantile if self.current_quantile else 0.0
+            q_hat = self.current_quantile if self.current_quantile is not None else 0.0
 
-        # I control: Integrator
+        # I control: integrator
         if self.use_integrator:
             if self.integrator_type == 'tan':
                 integrator_term = self._tan_integrator(self.cumulative_error, t)
@@ -300,115 +543,256 @@ class ConformalPIDPredictor:
         q_t = max(q_t, 0.0)
 
         return (point_forecast - q_t, point_forecast + q_t)
-    
-    def update(self, new_observation:float, alpha:float=0.05) -> None:
+
+    def update(
+        self,
+        new_observation: float,
+        alpha: float = 0.05,
+        X_new: Optional[np.ndarray] = None
+    ) -> None:
         self.update_count += 1
 
-        # get prediction before updating
-        if self.data is not None and len(self.data) >= self.ar_lags:
-            point_forecast = self.predictor.predict(self.data)
+        if self.data is not None and len(self.data) >= self.min_history:
+            # point forecast using exogenous info if available
+            point_forecast = self.predictor.predict(self.data, X=X_new)
 
             # conformity score
             score = np.abs(new_observation - point_forecast)
             self.conformity_scores.append(score)
 
-            # check coverage
-            lower, upper = self.predict_risk(alpha=alpha)
+            # check coverage (use same X_new for the prediction interval)
+            lower, upper = self.predict_risk(alpha=alpha, X_future=X_new)
             covered = lower <= new_observation <= upper
             err_t = 0 if covered else 1
 
-            # I control: Update cumulative error
+            # I control: update cumulative error
             self.cumulative_error += (err_t - alpha)
 
-            # P control: Update quantile
+            # P control: update base quantile
             if self.current_quantile is not None:
                 self.current_quantile += self.learning_rate * (err_t - alpha)
                 self.current_quantile = max(self.current_quantile, 0.0)
 
             self.coverage_history.append(covered)
 
-            # update data
-            if self.data is None:
-                self.data = np.array([new_observation])
-            else:
-                self.data = np.append(self.data, new_observation)
-                if len(self.data) > self.window_size:
-                    self.data = self.data[-self.window_size:]
+        # update stored data and exogenous history
+        if self.data is None:
+            self.data = np.array([new_observation])
+        else:
+            self.data = np.append(self.data, new_observation)
+            if len(self.data) > self.window_size:
+                self.data = self.data[-self.window_size:]
 
-            if self.update_count % self.refit_frequency == 0:
+        if X_new is not None:
+            X_new = np.asarray(X_new).reshape(1, -1)
+            if self.X is None:
+                self.X = X_new
+            else:
+                self.X = np.vstack([self.X, X_new])
+                if len(self.X) > self.window_size:
+                    self.X = self.X[-self.window_size:]
+
+        # periodic refit
+        if self.update_count % self.refit_frequency == 0:
+            if self.X is not None:
+                self.predictor.fit(self.data, self.X)
+            else:
                 self.predictor.fit(self.data)
+
 
 class AdaptiveConformalInference:
     """
-    Adaptive Conformal Inference (ACI) - Gibbs & Candes (2021)
-    Baseline method that adapts alpha_t instead of tracking quantile directly
+    Adaptive Conformal Inference (ACI) - Gibbs & Candès (2021)
+
+    Baseline method that adapts alpha_t instead of tracking quantile directly.
+
+    Extended to:
+    - accept either AR or SARIMAX as base predictor
+    - optionally use exogenous variables X
     """
 
     def __init__(
         self,
-        window_size:int=250,
-        learning_rate:float=0.005,
-        target_alpha:float=0.05,
-        ar_lags:int=3,
-        refit_frequency:int=10,
+        window_size: int = 250,
+        learning_rate: float = 0.005,
+        target_alpha: float = 0.05,
+        ar_lags: int = 3,
+        refit_frequency: int = 10,
+        predictor_name: str = 'ar',
+        predictor_params: dict | None = None,
     ):
+        """
+        Parameters
+        ----------
+        window_size : int
+            Rolling window length for fitting the base predictor.
+        learning_rate : float
+            Step size for updating alpha_t.
+        target_alpha : float
+            Target miscoverage level.
+        ar_lags : int
+            Legacy parameter for AR order (kept for backward compatibility).
+            If predictor_name='ar' and predictor_params does not specify 'lags'
+            or 'ar_lags', this is used.
+        refit_frequency : int
+            How often to refit the base predictor (in number of updates).
+        predictor_name : {'ar', 'sarimax'}
+            Which base predictor to use.
+        predictor_params : dict, optional
+            Parameters for the base predictor. For example:
+            - AR:       {'lags': 3}
+            - SARIMAX:  {'order': (1,0,0), 'seasonal_order': (1,0,0,12), ...}
+        """
         self.window_size = window_size
         self.learning_rate = learning_rate
         self.target_alpha = target_alpha
-        self.ar_lags = ar_lags
         self.refit_frequency = refit_frequency
+        self.predictor_name = predictor_name
 
-        self.data=None
-        self.predictor=SimpleARPredictor()
+        # Build predictor_params with sensible defaults
+        predictor_params = dict(predictor_params) if predictor_params is not None else {}
+
+        if predictor_name == 'ar':
+            # Map legacy ar_lags if not present
+            if 'lags' not in predictor_params and 'ar_lags' not in predictor_params:
+                predictor_params['lags'] = ar_lags
+        self.predictor_params = predictor_params
+
+        # Base predictor (AR or SARIMAX)
+        self.predictor = get_predictor(predictor_name, predictor_params)
+
+        # Determine minimum history length before we can use the predictor
+        if predictor_name == 'ar':
+            self.min_history = self.predictor_params.get(
+                'lags',
+                self.predictor_params.get('ar_lags', ar_lags)
+            )
+        elif predictor_name == 'sarimax':
+            order = self.predictor_params.get('order', (1, 0, 0))
+            seasonal_order = self.predictor_params.get('seasonal_order', (0, 0, 0, 0))
+            # heuristic minimum history if not explicitly provided
+            self.min_history = self.predictor_params.get(
+                'min_history',
+                max(10, sum(order) + seasonal_order[3] * sum(seasonal_order[:3]))
+            )
+        else:
+            self.min_history = 1  # fallback
+
+        # Internal state
+        self.data = None       # target series y
+        self.X = None          # exogenous variables, if any
         self.conformity_scores = []
         self.alpha_t = target_alpha
         self.coverage_history = []
         self.update_count = 0
 
-    def fit(self, data:np.ndarray) -> None:
+    def fit(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> None:
+        """
+        Fit the base predictor on the last `window_size` observations, with
+        optional exogenous variables X.
+        """
         self.data = data[-self.window_size:].copy()
-        self.predictor.fit(self.data)
 
+        if X is not None:
+            X = np.asarray(X)
+            self.X = X[-self.window_size:].copy()
+            # predictor.fit(data, X)
+            self.predictor.fit(self.data, self.X)
+        else:
+            self.X = None
+            self.predictor.fit(self.data)
+
+        # Initialize conformity scores from residuals (if available)
         if self.predictor.residuals is not None:
             self.conformity_scores = list(np.abs(self.predictor.residuals))
 
-    def predict_risk(self, alpha:float=0.05) -> tuple[float, float]:
+    def predict_risk(
+        self,
+        alpha: float = 0.05,
+        X_future: Optional[np.ndarray] = None
+    ) -> tuple[float, float]:
+        """
+        Produce a prediction interval [lower, upper] for the next observation.
+
+        Parameters
+        ----------
+        alpha : float
+            Not used directly (ACI uses alpha_t internally), but kept for API
+            compatibility with other models.
+        X_future : np.ndarray, optional
+            Exogenous values for the *next* time step. Ignored if base
+            predictor does not use exogenous variables.
+        """
         if self.data is None or len(self.conformity_scores) == 0:
             return (np.nan, np.nan)
-        
-        point_forecast = self.predictor.predict(self.data)
 
+        # One-step-ahead forecast (pass X_future when supported)
+        try:
+            point_forecast = self.predictor.predict(self.data, X_future=X_future)
+        except TypeError:
+            # For AR-only predictor
+            point_forecast = self.predictor.predict(self.data)
+
+        # Effective alpha_t is kept in [0.001, 0.999]
         effective_alpha = np.clip(self.alpha_t, 0.001, 0.999)
         quantile_level = 1 - effective_alpha
         q = np.percentile(self.conformity_scores, quantile_level * 100)
 
         return (point_forecast - q, point_forecast + q)
-    
-    def update(self, new_observation:float, alpha:float=0.05) -> None:
+
+    def update(
+        self,
+        new_observation: float,
+        alpha: float = 0.05,
+        X_new: Optional[np.ndarray] = None
+    ) -> None:
+        """
+        Update ACI state with a new observation and optional exogenous value.
+        """
         self.update_count += 1
 
-        if self.data is not None and len(self.data) >= self.ar_lags:
-            point_forecast = self.predictor.predict(self.data)
+        if self.data is not None and len(self.data) >= self.min_history:
+            # Forecast for conformity score
+            try:
+                point_forecast = self.predictor.predict(self.data, X_future=X_new)
+            except TypeError:
+                point_forecast = self.predictor.predict(self.data)
+
             score = np.abs(new_observation - point_forecast)
             self.conformity_scores.append(score)
 
-            lower, upper = self.predict_risk(alpha=alpha)
+            # Prediction interval for coverage check
+            lower, upper = self.predict_risk(alpha=alpha, X_future=X_new)
             covered = lower <= new_observation <= upper
             err_t = 0 if covered else 1
 
-            # ACI update
+            # ACI update: adjust alpha_t
             self.alpha_t = self.alpha_t - self.learning_rate * (err_t - self.target_alpha)
             self.coverage_history.append(covered)
 
-            # update data
-            if self.data is None:
-                self.data = np.array([new_observation])
-            else:
-                self.data = np.append(self.data, new_observation)
-                if len(self.data) > self.window_size:
-                    self.data = self.data[-self.window_size:]
+        # Update stored data history
+        if self.data is None:
+            self.data = np.array([new_observation])
+        else:
+            self.data = np.append(self.data, new_observation)
+            if len(self.data) > self.window_size:
+                self.data = self.data[-self.window_size:]
 
-            if self.update_count % self.refit_frequency == 0:
+        # Update exogenous history
+        if X_new is not None:
+            X_new = np.asarray(X_new).reshape(1, -1)
+            if self.X is None:
+                self.X = X_new
+            else:
+                self.X = np.vstack([self.X, X_new])
+                if len(self.X) > self.window_size:
+                    self.X = self.X[-self.window_size:]
+
+        # Periodic refit of base predictor
+        if self.update_count % self.refit_frequency == 0:
+            if self.X is not None:
+                self.predictor.fit(self.data, self.X)
+            else:
                 self.predictor.fit(self.data)
 
 
@@ -483,38 +867,59 @@ def christoffersen_test(
 
 def backtest_model(
         model,
-        data:np.ndarray,
-        train_size:int=250,
-        alpha:float=0.05,
-        model_name:str='Model'
+        data: np.ndarray,
+        train_size: int = 250,
+        alpha: float = 0.05,
+        model_name: str = 'Model',
+        X: Optional[np.ndarray] = None
     ):
     n = len(data)
-    model.fit(data[:train_size])
+
+    # Fit with or without exogenous X
+    if X is not None:
+        try:
+            model.fit(data[:train_size], X[:train_size])
+        except TypeError:
+            model.fit(data[:train_size])
+    else:
+        model.fit(data[:train_size])
 
     results = []
     violations = []
 
     for t in range(train_size, n):
-        lower, upper = model.predict_risk(alpha)
+        x_future = X[t] if X is not None else None
+
+        # Prediction interval
+        try:
+            lower, upper = model.predict_risk(alpha, X_future=x_future)
+        except TypeError:
+            lower, upper = model.predict_risk(alpha)
+
         actual = data[t]
         is_violation = (actual < lower) or (actual > upper)
         violations.append(1 if is_violation else 0)
 
+        interval_width = upper - lower if not np.isnan(upper - lower) else np.nan
         results.append({
-            'time':t,
-            'actual':actual,
-            'lower':lower,
-            'upper':upper,
-            'interval_width': upper - lower if not np.isnan(upper - lower) else np.nan,
+            'time': t,
+            'actual': actual,
+            'lower': lower,
+            'upper': upper,
+            'interval_width': interval_width,
             'violation': is_violation
         })
 
-        model.update(actual, alpha)
+        # Update model with new observation (and possibly exogenous)
+        try:
+            model.update(actual, alpha, X_new=x_future)
+        except TypeError:
+            model.update(actual, alpha)
 
     results_df = pd.DataFrame(results)
     violations_array = np.array(violations)
     total_violations = violations_array.sum()
-    coverage = 1 - total_violations/len(violations)
+    coverage = 1 - total_violations / len(violations)
     avg_width = results_df['interval_width'].mean()
 
     kupiec_p = kupiec_pof_test(total_violations, len(violations), alpha)
@@ -523,11 +928,11 @@ def backtest_model(
     return BacktestResult(
         method=model_name,
         coverage=coverage,
-        target_coverage=1-alpha,
+        target_coverage=1 - alpha,
         avg_interval_width=avg_width,
         violations=total_violations,
         total_observations=len(violations),
-        violation_rate=total_violations/len(violations),
+        violation_rate=total_violations / len(violations),
         conditional_coverage_pvalue=christoffersen_p,
         kupiec_pvalue=kupiec_p
     ), results_df
