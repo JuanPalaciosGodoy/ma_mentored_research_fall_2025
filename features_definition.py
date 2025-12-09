@@ -9,7 +9,7 @@ from API.eia_client import EIAClient
 from gridstatusio import GridStatusClient
 
 # other internal imports
-from data_transformations.transformations import get_HDD, get_CDD
+from data_transformations.transformations import add_derived_features, apply_boxcox_to_columns
 
 # KEYS
 FRED_API_KEY = "074ca13a0fb775130325ac8392ed51e3"
@@ -46,7 +46,15 @@ meteo_historical_weather_params = {
     1: {
         "latitude": 29.76,
         "longitude": 95.36,
-        "daily": ["temperature_2m_max", "temperature_2m_min"],
+        "daily": [
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "temperature_2m_mean",
+            "relative_humidity_2m_mean",
+            "cloud_cover_mean",
+            "precipitation_sum",
+            "wind_speed_10m_mean",
+        ],
         "location": "LZ_HOUSTON"
         }
 }
@@ -86,9 +94,17 @@ def read_features(
 
     # read meteo data
     df_meteo = get_meteo_features(params=meteo_params)
-    df_meteo = get_HDD(df=df_meteo) # calculate heating degree days
-    df_meteo = get_CDD(df=df_meteo) # calculate cooling degree days
-    df_meteo = df_meteo[['time','location','hdd','cdd']] # filter data
+    df_meteo = add_derived_features(df=df_meteo) # calculate tranformations
+    df_meteo = df_meteo[[
+        'time',
+        'location',
+        "heating_degrees",
+        "cooling_degrees",
+        "dew_point_simple",
+        "sunshine_fraction",
+        "rain_flag",
+        "wind_squared",
+        ]] # filter data
 
     # read fred data
     df_fred = get_fred_features(params=fred_params)
