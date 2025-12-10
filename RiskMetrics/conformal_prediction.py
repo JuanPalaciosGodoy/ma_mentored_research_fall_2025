@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.stats.stattools import jarque_bera
 
 
 
@@ -400,10 +402,123 @@ class SimpleSARIMAXPredictor:
 
         try:
             fc = self.result_.get_forecast(steps=1, exog=exog_fc)
-            return float(fc.predicted_mean.iloc[0])
+            pm = fc.predicted_mean
+
+            # Handle Series, 1-element array, or scalar
+            if hasattr(pm, "iloc"):                 # pandas Series
+                return float(pm.iloc[0])
+            elif isinstance(pm, (list, np.ndarray)):  # numpy array or list
+                return float(pm[0])
+            else:                                    # scalar fallback
+                return float(pm)
+
         except Exception as e:
             print(f"[SimpleSARIMAXPredictor] Predict failed, using fallback mean: {e}")
             return self.mean_
+
+    def print_diagnostics(
+        self,
+        lags: int = 24,
+        alpha: float = 0.05,
+        show_plots: bool = False,
+    ) -> None:
+        """
+        Print diagnostics for a fitted SARIMAX model wrapped by SimpleSARIMAXPredictor.
+
+        Parameters
+        ----------
+        predictor : SimpleSARIMAXPredictor or similar
+            Must have attributes: result_ (SARIMAXResults), order, seasonal_order.
+        lags : int
+            Number of lags for Ljung–Box test.
+        alpha : float
+            Significance level for hypothesis tests.
+        show_plots : bool
+            If True, calls result_.plot_diagnostics() to show standard residual plots.
+        """
+        # Basic checks
+        if self.result_ is None:
+            print("[Diagnostics] Predictor is not fitted or result_ is missing.")
+            return
+
+        res = self.result_
+
+        print("=" * 60)
+        print("SARIMAX Model Diagnostics")
+        print("=" * 60)
+
+        # Basic info
+        order = self.order
+        seasonal_order = self.seasonal_order
+
+        print(f"Order:           {order}")
+        print(f"Seasonal order:  {seasonal_order}")
+        print(f"Trend:           {self.trend}")
+        print("-" * 60)
+
+        # Information criteria
+        print(f"AIC:  {res.aic:.3f}")
+        print(f"BIC:  {res.bic:.3f}")
+        if hasattr(res, "hqic"):
+            print(f"HQIC: {res.hqic:.3f}")
+        print(f"Log-likelihood: {res.llf:.3f}")
+        print("-" * 60)
+
+        # Residual summary
+        resid = np.asarray(res.resid)
+        resid_mean = np.nanmean(resid)
+        resid_std = np.nanstd(resid, ddof=1)
+        resid_min = np.nanmin(resid)
+        resid_max = np.nanmax(resid)
+
+        print("Residual summary:")
+        print(f"  Mean: {resid_mean:.6f}")
+        print(f"  Std:  {resid_std:.6f}")
+        print(f"  Min:  {resid_min:.6f}")
+        print(f"  Max:  {resid_max:.6f}")
+        print("-" * 60)
+
+        # Ljung–Box test for autocorrelation
+        try:
+            lb_test = acorr_ljungbox(resid, lags=[lags], return_df=True)
+            lb_stat = lb_test["lb_stat"].iloc[0]
+            lb_pvalue = lb_test["lb_pvalue"].iloc[0]
+            print(f"Ljung–Box test (lag={lags}):")
+            print(f"  Statistic: {lb_stat:.3f}")
+            print(f"  p-value:   {lb_pvalue:.3f}")
+            if lb_pvalue < alpha:
+                print("  => Reject H0: residuals show autocorrelation.")
+            else:
+                print("  => Fail to reject H0: no strong evidence of autocorrelation.")
+        except Exception as e:
+            print(f"Ljung–Box test failed: {e}")
+
+        print("-" * 60)
+
+        # Jarque–Bera normality test
+        try:
+            jb_stat, jb_pvalue, skew, kurt = jarque_bera(resid)
+            print("Jarque–Bera normality test:")
+            print(f"  Statistic: {jb_stat:.3f}")
+            print(f"  p-value:   {jb_pvalue:.3f}")
+            print(f"  Skewness:  {skew:.3f}")
+            print(f"  Kurtosis:  {kurt:.3f}")
+            if jb_pvalue < alpha:
+                print("  => Reject H0: residuals are not normally distributed.")
+            else:
+                print("  => Fail to reject H0: residuals consistent with normality.")
+        except Exception as e:
+            print(f"Jarque–Bera test failed: {e}")
+
+        print("=" * 60)
+
+        # Optional: standard statsmodels diagnostic plots
+        if show_plots:
+            try:
+                res.plot_diagnostics(figsize=(10, 8), lags=lags)
+                print(res.summary())
+            except Exception as e:
+                print(f"[Diagnostics] plot_diagnostics failed: {e}")
 
 
 class ConformalPIDPredictor:
@@ -728,7 +843,7 @@ class AdaptiveConformalInference:
 
         # One-step-ahead forecast (pass X_future when supported)
         try:
-            point_forecast = self.predictor.predict(self.data, X_future=X_future)
+            point_forecast = self.predictor.predict(self.data, X=X_future)
         except TypeError:
             # For AR-only predictor
             point_forecast = self.predictor.predict(self.data)
@@ -754,7 +869,7 @@ class AdaptiveConformalInference:
         if self.data is not None and len(self.data) >= self.min_history:
             # Forecast for conformity score
             try:
-                point_forecast = self.predictor.predict(self.data, X_future=X_new)
+                point_forecast = self.predictor.predict(self.data, X=X_new)
             except TypeError:
                 point_forecast = self.predictor.predict(self.data)
 
@@ -868,6 +983,7 @@ def christoffersen_test(
 def backtest_model(
         model,
         data: np.ndarray,
+        dates: np.ndarray,
         train_size: int = 250,
         alpha: float = 0.05,
         model_name: str = 'Model',
@@ -879,6 +995,10 @@ def backtest_model(
     if X is not None:
         try:
             model.fit(data[:train_size], X[:train_size])
+            # show diagnostics
+            if hasattr(model, 'predictor'):
+                if hasattr(model.predictor, 'print_diagnostics') and callable(getattr(model.predictor, 'print_diagnostics')):
+                    model.predictor.print_diagnostics(lags=100, alpha=0.05, show_plots=True)
         except TypeError:
             model.fit(data[:train_size])
     else:
@@ -902,7 +1022,7 @@ def backtest_model(
 
         interval_width = upper - lower if not np.isnan(upper - lower) else np.nan
         results.append({
-            'time': t,
+            'time': dates[t],
             'actual': actual,
             'lower': lower,
             'upper': upper,
@@ -936,34 +1056,3 @@ def backtest_model(
         conditional_coverage_pvalue=christoffersen_p,
         kupiec_pvalue=kupiec_p
     ), results_df
-
-
-def generate_returns(
-        n:int=1000,
-        regime_changes:bool=True,
-        seasonality:bool=True
-) -> np.ndarray:
-    returns = np.zeros(n)
-    base_vol = 0.02
-
-    if regime_changes:
-        regime_points = [0, 200, 500, 700, n]
-        regime_vol_mult = [1.0, 2.0, 0.8, 1.5, 1.0]
-    else:
-        regime_points = [0, n]
-        regime_vol_mult = [1.0, 1.0]
-
-    current_regime = 0
-
-    for t in range(n):
-        while current_regime < len(regime_points) - 2 and t >= regime_points[current_regime + 1]:
-            current_regime += 1
-
-        vol_t = base_vol * regime_vol_mult[current_regime]
-
-        if t > 0:
-            vol_t *= (1+0.3*np.sin(2*np.pi*t/252))
-
-        returns[t] = vol_t * stats.t.rvs(df=5)
-
-    return returns
