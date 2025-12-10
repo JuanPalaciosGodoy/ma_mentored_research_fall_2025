@@ -13,7 +13,8 @@ from data_transformations.transformations import add_derived_features, apply_box
 
 # KEYS
 FRED_API_KEY = "074ca13a0fb775130325ac8392ed51e3"
-GRIDSTATUS_API_KEY = 'e2d40b6dcfff48c6834bd445100cf76e'
+#GRIDSTATUS_API_KEY = 'e2d40b6dcfff48c6834bd445100cf76e'
+GRIDSTATUS_API_KEY = '18148a1b3c274a9eb83e80bed9b7e82c'
 
 # GENERAL PARAMS
 START = "2020-01-01"
