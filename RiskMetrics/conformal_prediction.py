@@ -7,7 +7,10 @@ from scipy import stats
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.stats.stattools import jarque_bera
-
+from xgboost import XGBRegressor
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 
 
 @dataclass
@@ -192,9 +195,23 @@ def get_predictor(predictor_name: str, predictor_params: dict):
         predictor_params.setdefault('enforce_stationarity', False)
         predictor_params.setdefault('enforce_invertibility', False)
         return SimpleSARIMAXPredictor(**predictor_params)
+    
+    elif predictor_name == 'xgboost':
+        predictor_params.setdefault('lags', 5)
+        predictor_params.setdefault('n_estimators', 100)
+        predictor_params.setdefault('max_depth', 3)
+        predictor_params.setdefault('learning_rate', 0.1)
+        return SimpleXGBoostPredictor(**predictor_params)
+    
+    elif predictor_name == 'lstm':
+        predictor_params.setdefault('seq_length', 10)
+        predictor_params.setdefault('hidden_size', 50)
+        predictor_params.setdefault('num_layers', 2)
+        predictor_params.setdefault('epochs', 50)
+        return SimpleLSTMPredictor(**predictor_params)
 
     else:
-        raise ValueError("predictor_name must be 'ar' or 'sarimax'")
+        raise ValueError("predictor_name must be 'ar', 'sarimax', 'xgboost', or 'lstm'")
 
 
 
@@ -520,6 +537,292 @@ class SimpleSARIMAXPredictor:
             except Exception as e:
                 print(f"[Diagnostics] plot_diagnostics failed: {e}")
 
+################
+# XGBOOST MODEL
+################
+
+class SimpleXGBoostPredictor:
+    """
+    XGBoost wrapper for time series prediction with conformal prediction.
+    Creates lagged features and uses XGBoost for point forecasts.
+    """
+
+    def __init__(
+        self,
+        lags: int = 5,
+        n_estimators: int = 100,
+        max_depth: int = 3,
+        learning_rate: float = 0.1,
+        **xgb_params
+    ):
+        self.lags = lags
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.xgb_params = xgb_params
+        
+        self.model = None
+        self.residuals = None
+        self.mean_ = 0.0
+        self.is_fitted = False
+
+    def _create_features(self, data: np.ndarray, X: Optional[np.ndarray] = None):
+        """Create lagged features for time series"""
+        n = len(data)
+        if n < self.lags + 1:
+            return None
+        
+        # Create lag features
+        features = []
+        for i in range(self.lags):
+            features.append(data[self.lags-i-1:-i-1])
+        
+        X_lag = np.column_stack(features)
+        
+        # Add exogenous features
+        if X is not None:
+            X = np.asarray(X)
+            if X.ndim == 1:
+                X = X.reshape(-1, 1)
+            X_subset = X[self.lags:]
+            X_lag = np.column_stack([X_lag, X_subset])
+        
+        return X_lag
+    
+    def fit(self, data: np.ndarray, X: Optional[np.ndarray] = None):
+        """Fit XGBoost model on time series data"""
+        data = np.asarray(data, dtype=float).ravel()
+        self.mean_ = float(np.mean(data)) if len(data) > 0 else 0.0
+        
+        if len(data) < self.lags + 2:
+            self.is_fitted = False
+            self.residuals = np.zeros(1)
+            return
+        
+        X_features = self._create_features(data, X)
+        if X_features is None:
+            self.is_fitted = False
+            self.residuals = np.zeros(1)
+            return
+        
+        y = data[self.lags:]
+        
+        try:
+            self.model = XGBRegressor(
+                n_estimators=self.n_estimators,
+                max_depth=self.max_depth,
+                learning_rate=self.learning_rate,
+                objective='reg:squarederror',
+                **self.xgb_params
+            )
+            self.model.fit(X_features, y, verbose=False)
+            
+            # Calculate residuals
+            y_pred = self.model.predict(X_features)
+            self.residuals = y - y_pred
+            self.is_fitted = True
+            
+        except Exception as e:
+            print(f"[SimpleXGBoostPredictor] Fit failed: {e}")
+            self.is_fitted = False
+            self.residuals = np.zeros(1)
+    
+    def predict(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> float:
+        """One-step-ahead prediction"""
+        if not self.is_fitted or self.model is None:
+            return self.mean_
+        
+        data = np.asarray(data, dtype=float).ravel()
+        if len(data) < self.lags:
+            return self.mean_
+        
+        # Create features
+        recent = data[-self.lags:][::-1].reshape(1, -1)
+        
+        # Add exogenous features
+        if X is not None:
+            X = np.asarray(X, dtype=float)
+            if X.ndim == 1:
+                X = X.reshape(1, -1)
+            recent = np.column_stack([recent, X])
+        
+        try:
+            pred = self.model.predict(recent)
+            return float(pred[0])
+        except Exception as e:
+            print(f"[SimpleXGBoostPredictor] Predict failed: {e}")
+            return self.mean_
+        
+ ################
+# LSTM MODEL
+################       
+class SimpleLSTMPredictor:
+    """
+    LSTM wrapper for time series prediction with conformal prediction.
+    """
+    
+    def __init__(
+        self,
+        seq_length: int = 10,
+        hidden_size: int = 50,
+        num_layers: int = 2,
+        epochs: int = 50,
+        batch_size: int = 32,
+        learning_rate: float = 0.001,
+        verbose: int = 0
+    ):
+        
+        self.seq_length = seq_length
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.verbose = verbose
+        
+        self.model = None
+        self.residuals = None
+        self.mean_ = 0.0
+        self.std_ = 1.0
+        self.is_fitted = False
+        self.n_exog_features = 0
+    
+    def _build_model(self, input_size: int):
+        """Build LSTM model using Keras"""
+        model = keras.Sequential()
+        
+        # 1st layer
+        model.add(layers.LSTM(
+            self.hidden_size,
+            return_sequences=(self.num_layers > 1),
+            input_shape=(self.seq_length, input_size)
+        ))
+        
+        # 2nd layers
+        for i in range(1, self.num_layers):
+            return_seq = (i < self.num_layers - 1)
+            model.add(layers.LSTM(self.hidden_size, return_sequences=return_seq))
+        
+        # Output layer
+        model.add(layers.Dense(1))
+        
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=self.learning_rate),
+            loss='mse'
+        )
+        
+        return model
+    
+    def _create_sequences(self, data: np.ndarray, X: Optional[np.ndarray] = None):
+        """Create sequences for LSTM training"""
+        data = np.asarray(data, dtype=float).ravel()
+        n = len(data)
+        
+        if n < self.seq_length + 1:
+            return None, None
+        
+        sequences = []
+        targets = []
+        
+        # Normalize data
+        self.mean_ = float(np.mean(data))
+        self.std_ = float(np.std(data)) if np.std(data) > 0 else 1.0
+        data_norm = (data - self.mean_) / self.std_
+        
+        # Determine input size
+        input_size = 1
+        if X is not None:
+            X = np.asarray(X, dtype=float)
+            if X.ndim == 1:
+                X = X.reshape(-1, 1)
+            self.n_exog_features = X.shape[1]
+            input_size += self.n_exog_features
+        
+        for i in range(n - self.seq_length):
+            # Target series sequence
+            seq = data_norm[i:i+self.seq_length].reshape(-1, 1)
+            
+            # Add exogenous features
+            if X is not None:
+                exog_seq = X[i:i+self.seq_length]
+                seq = np.concatenate([seq, exog_seq], axis=1)
+            
+            sequences.append(seq)
+            targets.append(data_norm[i+self.seq_length])
+        
+        return np.array(sequences, dtype=np.float32), np.array(targets, dtype=np.float32)
+    
+    def fit(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> None:
+        """Fit LSTM model on time series data"""
+        sequences, targets = self._create_sequences(data, X)
+        
+        if sequences is None:
+            self.is_fitted = False
+            self.residuals = np.zeros(1)
+            return
+        
+        input_size = sequences.shape[2]
+        
+        try:
+            # Train model
+            self.model = self._build_model(input_size)
+            
+            self.model.fit(
+                sequences,
+                targets,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                verbose=self.verbose
+            )
+            
+            # Calculate residuals
+            predictions = self.model.predict(sequences, verbose=0).flatten()
+            
+            # Denormalize predictions
+            predictions_denorm = predictions * self.std_ + self.mean_
+            targets_denorm = targets * self.std_ + self.mean_
+            self.residuals = targets_denorm - predictions_denorm
+            self.is_fitted = True
+            
+        except Exception as e:
+            print(f"[SimpleLSTMPredictor] Fit failed: {e}")
+            self.is_fitted = False
+            self.residuals = np.zeros(1)
+    
+    def predict(self, data: np.ndarray, X: Optional[np.ndarray] = None) -> float:
+        """One-step-ahead prediction"""
+        if not self.is_fitted or self.model is None:
+            return self.mean_
+        
+        data = np.asarray(data, dtype=float).ravel()
+        if len(data) < self.seq_length:
+            return self.mean_
+        
+        # Prepare sequence
+        recent = data[-self.seq_length:]
+        recent_norm = (recent - self.mean_) / self.std_
+        seq = recent_norm.reshape(1, self.seq_length, 1)
+        
+        # Add exogenous features
+        if X is not None and self.n_exog_features > 0:
+            X = np.asarray(X, dtype=float)
+            if X.ndim == 1:
+                X = X.reshape(1, -1)
+            # Repeat X for sequence length
+            X_seq = np.repeat(X, self.seq_length, axis=0).reshape(1, self.seq_length, -1)
+            seq = np.concatenate([seq, X_seq], axis=2)
+        
+        try:
+            pred_norm = self.model.predict(seq, verbose=0)[0, 0]
+            
+            # Denormalize
+            pred = pred_norm * self.std_ + self.mean_
+            return float(pred)
+        except Exception as e:
+            print(f"[SimpleLSTMPredictor] Predict failed: {e}")
+            return self.mean_
+
+    
 
 class ConformalPIDPredictor:
     """

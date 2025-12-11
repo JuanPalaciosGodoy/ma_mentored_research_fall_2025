@@ -129,11 +129,21 @@ def plot_rolling_statistics(results:dict, details:dict, window:int=50):
 
 def plot_prediction_intervals(results:dict, details:dict):
 
-    fig, axes = plt.subplots(3,2,figsize=(25,18))
     methods = list(results.keys())
+    n_methods = len(methods)
+
+    n_cols = 2
+    n_rows = (n_methods + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(25, 6*n_rows))
+
+    if n_methods == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
 
     for idx, method in enumerate(methods):
-        ax = axes[idx // 2, idx % 2]
+        ax = axes[idx // n_cols, idx % n_cols]
         df = details[method]
 
         # Plot actual returns
@@ -154,6 +164,15 @@ def plot_prediction_intervals(results:dict, details:dict):
         ax.set_ylabel('Return', fontsize=10)
         ax.legend(loc='upper right', fontsize=8)
         ax.grid(alpha=0.3)
+
+    for idx in range(n_methods, n_rows * n_cols):
+        axes[idx // n_cols, idx % n_cols].set_visible(False)
+
+    plt.suptitle(
+        'Prediction Intervals Over Time: Conformal vs VaR Methods\n', 
+        fontsize=14, 
+        fontweight='bold'
+    )
 
     plt.suptitle('Prediction Intervals Over Time: Conformal vs VaR Methods \n', fontsize=11, fontweight='bold')
     plt.tight_layout()
