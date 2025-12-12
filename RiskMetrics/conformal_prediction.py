@@ -939,7 +939,7 @@ class ConformalPIDPredictor:
             return (np.nan, np.nan)
 
         # point forecast (passes exogenous for next step if provided)
-        point_forecast = self.predictor.predict(self.data, X==X_future)
+        point_forecast = self.predictor.predict(self.data, X=X_future)
 
         # time index for PID control
         t = len(self.conformity_scores) + 1
