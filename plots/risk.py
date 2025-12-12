@@ -4,7 +4,7 @@ import numpy as np
 def plot_coverage_comparison(results:dict):
 
     fig, axes = plt.subplots(1, 3, figsize=(25,12))
-    colors = ['#e74c3c', '#f39c12', '#3498db', '#9b59b6', '#f1c40f', '#2ecc71', '#ecf0f1']
+    colors = ['#e74c3c', '#f39c12', '#3498db', '#9b59b6', '#f1c40f', '#2ecc71', '#ecf0f1', '#e74c3c', '#f39c12', '#3498db']
 
     methods = list(results.keys())
 
@@ -58,7 +58,7 @@ def plot_coverage_comparison(results:dict):
 def plot_rolling_statistics(results:dict, details:dict, window:int=50):
 
     fig, axes = plt.subplots(2, 2, figsize=(25,18))
-    colors = ['#e74c3c', '#f39c12', '#3498db', '#9b59b6', '#f1c40f', '#2ecc71', '#ecf0f1']
+    colors = ['#e74c3c', '#f39c12', '#3498db', '#9b59b6', '#f1c40f', '#2ecc71', '#ecf0f1', '#e74c3c', '#f39c12', '#3498db']
 
     methods = list(results.keys())
 
