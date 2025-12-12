@@ -1367,6 +1367,6 @@ def backtest_model(
         violations=total_violations,
         total_observations=len(violations),
         violation_rate=total_violations / len(violations),
-        independence_coverage_pvalue=christoffersen_p,
+        conditional_coverage_pvalue=christoffersen_p,
         kupiec_pvalue=kupiec_p
     ), results_df
