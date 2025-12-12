@@ -854,11 +854,13 @@ class ConformalPIDPredictor:
         self.K_I = K_I
         self.C_sat = C_sat
         self.predictor_name = predictor_name
-        self.predictor_params = predictor_params
         self.refit_frequency = refit_frequency
 
         self.data = None           # y
         self.X = None              # exogenous (if any)
+
+        # Build predictor_params with sensible defaults
+        self.predictor_params = dict(predictor_params) if predictor_params is not None else {}
 
         # base predictor (AR or SARIMAX)
         self.predictor = get_predictor(
@@ -937,7 +939,7 @@ class ConformalPIDPredictor:
             return (np.nan, np.nan)
 
         # point forecast (passes exogenous for next step if provided)
-        point_forecast = self.predictor.predict(self.data, X_future==X_future)
+        point_forecast = self.predictor.predict(self.data, X=X_future)
 
         # time index for PID control
         t = len(self.conformity_scores) + 1
@@ -1227,11 +1229,12 @@ def kupiec_pof_test(
     Kupiec Proportion of Failures (POF) test.
     violations: 0/1 series. 1 -> VaR violated.
     """
-    if violations == 0 or violations == n:
-        return 0.0
-    p_hat = violations / n
+    eps = 1e-10
+    p_hat = np.clip(violations / n, eps, 1-eps)
+    alpha_clipped = np.clip(alpha, eps, 1-eps)
+
     lr = -2 * (
-        (n - violations) * np.log(1 - alpha) + violations * np.log(alpha) -
+        (n - violations) * np.log(1 - alpha_clipped) + violations * np.log(alpha_clipped) -
         (n - violations) * np.log(1 - p_hat) - violations * np.log(p_hat)
     )
     return 1 - stats.chi2.cdf(lr, df=1)
@@ -1272,12 +1275,20 @@ def christoffersen_test(
         return 1.0
 
     try:
-        lr_ind = -2 * (
-            n00 * np.log(1 - pi) + n01 * np.log(pi) +
-            n10 * np.log(1 - pi) + n11 * np.log(pi) -
-            n00 * np.log(1 - pi01) + n01 * np.log(pi01) -
-            n10 * np.log(1 - pi11) + n11 * np.log(pi11)
+        ll_null = (
+            n00 * np.log(1-pi) +
+            n01 * np.log(pi) +
+            n10 * np.log(1 - pi) +
+            n11 * np.log(pi)
         )
+        ll_alt = (
+            n00 * np.log(1-pi01) +
+            n01 * np.log(pi01) +
+            n10 * np.log(1 - pi11) +
+            n11 * np.log(pi11)
+        )
+
+        lr_ind = -2 * (ll_null - ll_alt)
         return 1 - stats.chi2.cdf(lr_ind, df=1)
     except:
         return 1.0
